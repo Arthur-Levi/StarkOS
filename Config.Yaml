@@ -1,0 +1,26 @@
+kernel:
+  name: StarkOS
+  version: "0.4"
+  auto_start: true
+  startup_timeout: 30.0
+  shutdown_timeout: 30.0
+  publish_events: true
+
+logging:
+  level: INFO
+  structured: false
+
+services: {}
+
+modules: {}
+
+identity:
+  persona: STARK
+
+environments:
+  development:
+    logging:
+      level: DEBUG
+  production:
+    logging:
+      level: WARNING
