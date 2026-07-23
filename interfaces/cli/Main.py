@@ -32,28 +32,63 @@ from typing import Any, Mapping
 
 import yaml
 
+from core.auto_engineer import AutoEngineer, AutoEngineerConfig
+from core.cognitive_engine import CognitiveEngine, CognitiveEngineConfig
 from core.config_manager import ConfigManager, Environment
 from core.event_bus import EventBus
 from core.health_monitor import HealthMonitor
 from core.identity import Identity
 from core.kernel import Kernel, KernelConfig, KernelState
+from core.knowledge_graph import KnowledgeGraph, KnowledgeGraphConfig
 from core.lifecycle import LifecycleManager
+from core.logger import LoggingConfig
+from core.logger import LoggingConfigurationError as CoreLoggingConfigurationError
+from core.logger import configure_logging as configure_core_logging
+from core.logger import get_logger
 from core.module_registry import ModuleRegistry
 from core.service_container import ServiceContainer
+from core.vision_engine import VisionEngine, VisionEngineConfig
+from core.voice_interface import VoiceInterface, VoiceInterfaceConfig
 from interfaces.cli.console import StarkConsole
 
-logger = logging.getLogger(__name__)
+logger = get_logger("main")
 
 # =============================================================================
 # Constants
 # =============================================================================
 
-DEFAULT_CONFIG_PATH = Path("Config.Yaml")
+DEFAULT_CONFIG_PATH = Path("config/config.yaml")
 DEFAULT_ENVIRONMENT = "development"
 SUPPORTED_ENVIRONMENTS = ("development", "testing", "production")
 DEFAULT_LOG_LEVEL = "INFO"
 APPLICATION_NAME = "StarkOS"
 APPLICATION_VERSION = "0.4"
+
+
+def resolve_config_path(path: Path) -> Path:
+    """Resolve a config path against the repository layout.
+
+    The repository currently ships the config as Config.Yaml at the project
+    root, while the bootstrap previously expected config/config.yaml.
+    This helper accepts both locations and keeps the CLI behavior stable.
+    """
+    if path.exists():
+        return path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates = (
+        path,
+        repo_root / path,
+        repo_root / "Config.Yaml",
+        repo_root / "config" / "config.yaml",
+        repo_root / "config" / "Config.Yaml",
+    )
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return path
 
 # =============================================================================
 # Exceptions
@@ -128,10 +163,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
 # =============================================================================
 
 def load_config(path: Path) -> Mapping[str, Any]:
-    if not path.exists():
-        raise ConfigurationError(f"Configuration file not found: {path}")
+    resolved_path = resolve_config_path(path)
+    if not resolved_path.exists():
+        raise ConfigurationError(f"Configuration file not found: {resolved_path}")
     try:
-        with path.open("r", encoding="utf-8") as fp:
+        with resolved_path.open("r", encoding="utf-8") as fp:
             config = yaml.safe_load(fp)
     except yaml.YAMLError as exc:
         raise ConfigurationError("Invalid YAML configuration.") from exc
@@ -140,28 +176,41 @@ def load_config(path: Path) -> Mapping[str, Any]:
     if not isinstance(config, dict):
         raise ConfigurationError("Configuration root must be a mapping.")
     return config
+    return config
 
 def configure_logging(config: Mapping[str, Any], *, debug: bool) -> None:
-    logging_cfg = config.get("logging")
+    """
+    Configure logging for the whole process via core.logger -- the same
+    centralized setup (console + optional rotating file, plain-text or
+    JSON, correlation ids) every module's logger participates in.
+
+    A `logging:` section with a `version` key is treated as a raw
+    stdlib `dictConfig` schema for advanced use; otherwise StarkOS's own
+    simple {level, structured, log_file} shape is used.
+    """
+    logging_cfg = config.get("logging") or {}
+
     if isinstance(logging_cfg, dict) and "version" in logging_cfg:
-        # Only treat it as a full dictConfig schema if it actually looks
-        # like one (has "version"); otherwise it's StarkOS's own simple
-        # {level, structured} section and falls through to basicConfig.
         try:
             logging.config.dictConfig(logging_cfg)
-            logger.debug("Logging configured from YAML.")
+            logger.debug("Logging configured from a raw dictConfig section in YAML.")
             return
         except Exception as exc:
             raise LoggingConfigurationError("Invalid logging configuration.") from exc
 
-    level_name = "DEBUG" if debug else str((logging_cfg or {}).get("level", DEFAULT_LOG_LEVEL))
-    level = getattr(logging, level_name.upper(), logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        force=True,
-    )
-    logger.debug("Default logging configuration loaded.")
+    level_name = "DEBUG" if debug else str(logging_cfg.get("level", DEFAULT_LOG_LEVEL))
+    log_file = logging_cfg.get("log_file")
+
+    try:
+        configure_core_logging(
+            LoggingConfig(
+                level=level_name,
+                structured=bool(logging_cfg.get("structured", False)),
+                log_file=Path(log_file) if log_file else None,
+            )
+        )
+    except CoreLoggingConfigurationError as exc:
+        raise LoggingConfigurationError("Invalid logging configuration.") from exc
 
 # =============================================================================
 # Bootstrap Assembly
@@ -175,7 +224,7 @@ def build_bootstrap_config(args: argparse.Namespace) -> BootstrapConfig:
     NOTE: the original main.py called this function from async_main() but
     never defined it -- every run failed immediately with a NameError.
     """
-    config_path = Path(args.config)
+    config_path = resolve_config_path(Path(args.config))
     raw_config = load_config(config_path)
 
     return BootstrapConfig(
@@ -237,14 +286,22 @@ def print_report(title: str, report: Mapping[str, Any]) -> None:
 def build_kernel(bootstrap: BootstrapConfig) -> Kernel:
     """
     Composition root: wires ConfigManager, EventBus, ModuleRegistry,
-    LifecycleManager, HealthMonitor, Identity and Kernel together.
+    LifecycleManager, HealthMonitor, Identity, the five v0.4 cognitive-
+    stack modules (KnowledgeGraph, AutoEngineer, CognitiveEngine,
+    VisionEngine, VoiceInterface) and Kernel together.
 
     IMPORTANT: Kernel.__init__ already registers ServiceContainer,
     ModuleRegistry, EventBus and LifecycleManager into the ServiceContainer
     it's given. Re-registering those same four here (as the original
     main.py did) raises DuplicateServiceError on every boot. This
     composition root only registers what Kernel does NOT register on its
-    own: ConfigManager, HealthMonitor and Identity.
+    own: ConfigManager, HealthMonitor, Identity and the cognitive-stack
+    modules below.
+
+    Registration order matters only for readability of the startup log --
+    every module resolves its siblings from the already-fully-populated
+    ServiceContainer during its own initialize(), not from registration
+    order, so there's no hidden ordering dependency here.
     """
     logger.info("Building StarkOS runtime.")
 
@@ -269,6 +326,37 @@ def build_kernel(bootstrap: BootstrapConfig) -> Kernel:
     identity = Identity(services=services)
     services.register_instance(identity)
 
+    # --- v0.4 cognitive stack -------------------------------------------
+    knowledge_graph = KnowledgeGraph(
+        services=services,
+        config=KnowledgeGraphConfig(persist_path=Path("data/knowledge_graph.json")),
+    )
+    services.register_instance(knowledge_graph)
+
+    auto_engineer = AutoEngineer(services=services, config=AutoEngineerConfig())
+    auto_engineer.bind_knowledge_graph(knowledge_graph)
+    services.register_instance(auto_engineer)
+
+    cognitive_engine = CognitiveEngine(services=services, config=CognitiveEngineConfig())
+    cognitive_engine.bind_identity(identity)
+    cognitive_engine.bind_knowledge_graph(knowledge_graph)
+    cognitive_engine.bind_auto_engineer(auto_engineer)
+    services.register_instance(cognitive_engine)
+
+    vision_engine = VisionEngine(services=services, config=VisionEngineConfig())
+    vision_engine.bind_identity(identity)
+    vision_engine.bind_knowledge_graph(knowledge_graph)
+    vision_engine.bind_auto_engineer(auto_engineer)
+    vision_engine.bind_cognitive_engine(cognitive_engine)
+    services.register_instance(vision_engine)
+
+    voice_interface = VoiceInterface(
+        services=services,
+        config=VoiceInterfaceConfig(enabled=not bootstrap.no_voice),
+    )
+    voice_interface.bind_identity(identity)
+    services.register_instance(voice_interface)
+
     kernel_section = config_manager.kernel_config()
     kernel_config = KernelConfig(
         name=str(kernel_section.get("name", APPLICATION_NAME)),
@@ -291,8 +379,18 @@ def build_kernel(bootstrap: BootstrapConfig) -> Kernel:
 
     identity.bind_kernel(kernel)
     identity.bind_event_bus(event_bus)
+    auto_engineer.bind_kernel(kernel)
+    cognitive_engine.bind_kernel(kernel)
+    vision_engine.bind_kernel(kernel)
+    voice_interface.bind_kernel(kernel)
 
-    logger.info("Kernel created successfully.")
+    kernel.register_module(knowledge_graph, name="knowledge_graph", priority=100)
+    kernel.register_module(auto_engineer, name="auto_engineer", priority=150)
+    kernel.register_module(cognitive_engine, name="cognitive_engine", priority=200)
+    kernel.register_module(vision_engine, name="vision_engine", priority=220)
+    kernel.register_module(voice_interface, name="voice_interface", priority=250)
+
+    logger.info("Kernel created successfully.", extra={"modules": len(registry.list_modules())})
     return kernel
 
 # =============================================================================

@@ -15,6 +15,7 @@ Responsibilities
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 
 from dataclasses import dataclass, field
@@ -22,15 +23,21 @@ from datetime import datetime
 from enum import Enum, IntEnum, auto
 from typing import Any, Sequence
 
+from core.logger import get_logger
 from core.service_container import ServiceContainer
 
-logger = logging.getLogger(__name__)
+logger = get_logger("identity")
+
+# Light, honest heuristics for varying tone -- not natural-language
+# understanding. A greeting/question is recognized by shape, not meaning.
+_GREETING_PATTERN = re.compile(r"^\s*(oi|ol[aá]|hello|hi|hey|e\s*a[ií])\b", re.IGNORECASE)
+_QUESTION_PATTERN = re.compile(r"\?\s*$")
 
 # =============================================================================
 # Exceptions
 # =============================================================================
 
-class IdentityError(RuntimeError):
+class IdentityError(Exception):
     """Base exception for Identity."""
 
 class ClearanceError(IdentityError):
@@ -213,16 +220,19 @@ class Identity:
         return tuple(self._history)
 
     def respond(self, message: str) -> IdentityResponse:
+        """
+        Compose a reply. Tone varies by the *shape* of the message
+        (greeting-like, question-like, or a plain statement/request) via
+        the light regex heuristics above -- this is elegant phrasing
+        variation, not natural-language understanding. For anything
+        requiring real comprehension, StarkOS routes through
+        CognitiveEngine/KnowledgeGraph instead; Identity is the voice,
+        not the reasoning.
+        """
         logger.info("Generating contextual response.")
         self.remember("user", message)
 
-        text = (
-            f"At your service. "
-            f"I received your request: '{message}'. "
-            "I'll analyze the available runtime context before suggesting "
-            "the next course of action."
-        )
-
+        text = self._compose_response_text(message)
         response = IdentityResponse(
             text=text,
             suggestions=self.proactive_suggestions(),
@@ -236,16 +246,73 @@ class Identity:
         self.remember(self.persona.name, response.text)
         return response
 
+    def _compose_response_text(self, message: str) -> str:
+        stripped = message.strip()
+        if not stripped:
+            return "I'm listening whenever you're ready."
+
+        if _GREETING_PATTERN.match(stripped):
+            return self._greeting_text()
+
+        if _QUESTION_PATTERN.search(stripped):
+            return (
+                f"A fair question. Let me weigh '{stripped}' against the current "
+                "runtime context before I commit to an answer."
+            )
+
+        return (
+            f"Understood. I'll treat '{stripped}' as the priority and keep you "
+            "posted as it's handled."
+        )
+
+    def _greeting_text(self) -> str:
+        hour = datetime.now().hour
+        if hour < 12:
+            salutation = "Good morning"
+        elif hour < 18:
+            salutation = "Good afternoon"
+        else:
+            salutation = "Good evening"
+
+        if self._founder.authenticated:
+            return f"{salutation}, {self._founder.display_name}. Everything is exactly as you left it."
+        return f"{salutation}. Systems are green and standing by."
+
     def proactive_suggestions(self) -> tuple[str, ...]:
-        suggestions = [
-            "Inspect registered modules.",
-            "Review system health.",
-            "Execute a demonstration.",
-        ]
-        return tuple(suggestions)
+        """
+        Suggestions tailored to the bound Kernel's actual state where
+        possible -- e.g. "start it" when stopped, "check health" when
+        running -- rather than a fixed list regardless of context.
+        Falls back to generic suggestions if no Kernel is bound yet.
+        """
+        if self._kernel is None:
+            return (
+                "Bind me to the Kernel so I can watch over the whole system.",
+                "Review what modules are registered.",
+            )
+
+        state_name = getattr(getattr(self._kernel, "state", None), "name", None)
+
+        if state_name in ("CREATED", "STOPPED"):
+            return ("Start the Kernel when you're ready.", "Review the current configuration.")
+        if state_name == "RUNNING":
+            return ("Review system health.", "Run a full diagnostics sweep.", "Ask me to run the demonstration.")
+        if state_name == "FAILED":
+            return ("Something needs your attention -- the last operation failed.", "Check the logs before retrying.")
+        return ("Inspect registered modules.", "Review system health.")
 
     def greet(self) -> IdentityResponse:
-        return self.respond("greeting")
+        """A dedicated greeting -- distinct from `respond()` so a greeting
+        never gets recorded as if the user had typed the word "greeting"."""
+        text = self._greeting_text()
+        response = IdentityResponse(
+            text=text,
+            suggestions=self.proactive_suggestions(),
+            mood="professional",
+            metadata={"history": len(self._history), "mode": self.mode.value},
+        )
+        self.remember(self.persona.name, response.text)
+        return response
 
     def metadata(self) -> dict[str, Any]:
         return {

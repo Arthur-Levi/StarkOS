@@ -81,9 +81,10 @@ from core.auto_engineer import Assembly, AutoEngineer, Component
 from core.cognitive_engine import CognitiveEngine
 from core.identity import Identity
 from core.knowledge_graph import KnowledgeGraph
+from core.logger import get_logger
 from core.service_container import ServiceContainer
 
-logger = logging.getLogger("starkos.vision_engine")
+logger = get_logger("vision_engine")
 
 # =============================================================================
 # Exceptions
