@@ -6,15 +6,29 @@ Knowledge storage and long-term memory subsystem for StarkOS.
 
 Responsibilities
 ----------------
-- Store knowledge as a graph: nodes (concepts, memories, events, entities)
-  connected by typed, weighted relations.
-- Generate and store embeddings for nodes, enabling semantic search.
+- Store knowledge as a graph: nodes (concepts, memories, events, entities,
+  and structured engineering concepts -- components, materials, projects,
+  standards) connected by typed, weighted relations.
+- Generate and store embeddings for nodes, enabling semantic search via
+  an incrementally-updated, numpy-accelerated (when available) vector
+  index -- not a naive full rescan on every call.
 - Provide long-term memory: an optional durable (JSON-file) snapshot so
-  knowledge survives process restarts, in addition to the in-memory graph.
+  knowledge survives process restarts; usage tracking (access_count/
+  last_accessed_at) and optional near-duplicate reinforcement in
+  remember() keep it useful rather than an ever-growing pile; explicit
+  prune_stale_memories() for real memory management.
+- Basic RAG (retrieval-augmented generation) retrieval: retrieve_context()
+  finds and formats the most relevant grounded nodes for a query, ready
+  to hand to a generator once StarkOS has one -- see the honesty note
+  in that section.
 - Bridge to Identity: ingest its short-term conversation history into
   durable, searchable memory nodes.
 - Bridge to Kernel: subscribe to system-level events (kernel/module
   lifecycle) as episodic memory, and snapshot Kernel diagnostics on demand.
+- Bridge to CognitiveEngine (and anything else that binds it): the
+  domain-modeling constructors (add_component/add_material/add_project/
+  add_standard) and retrieve_context() are the intended surface for a
+  planner to ground itself in real, stored engineering knowledge.
 - Degrade gracefully when no real embedding model is configured -- falls
   back to deterministic hashing-based vectors, then to plain keyword
   overlap, rather than failing outright.
@@ -62,17 +76,18 @@ import math
 import re
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import RLock
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Optional, Protocol, Sequence, runtime_checkable
 
 from core.event_bus import Event, EventBus
 from core.identity import ConversationTurn, Identity
+from core.logger import get_logger
 from core.service_container import ServiceContainer
 
-logger = logging.getLogger("starkos.knowledge_graph")
+logger = get_logger("knowledge_graph")
 
 # =============================================================================
 # Exceptions
@@ -116,6 +131,11 @@ class KnowledgeNode:
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
     source: str = "unknown"
+    # Usage tracking -- how retrieve_context()/search() "touch" a node
+    # each time it's actually retrieved. Backs prune_stale_memories()
+    # and gives a real signal for future recency/frequency-aware ranking.
+    access_count: int = 0
+    last_accessed_at: Optional[datetime] = None
 
 @dataclass(slots=True, frozen=True)
 class KnowledgeRelation:
@@ -135,6 +155,49 @@ class SearchResult:
 
     node: KnowledgeNode
     score: float
+
+@dataclass(slots=True, frozen=True)
+class RetrievedContext:
+    """One piece of context retrieved for RAG-style grounding -- a node,
+    its relevance score, and (optionally) a note on how it relates to
+    its neighbors."""
+
+    node: KnowledgeNode
+    score: float
+    relation_context: tuple[str, ...] = ()
+
+class NodeType:
+    """
+    Well-known `node_type` values -- the vocabulary this graph and the
+    rest of StarkOS already use (auto_engineer's design_iteration/bom/
+    risk_assessment, cognitive_engine's goal/plan_execution,
+    vision_engine's visual_observation/reconstruction_attempt,
+    security_core's audit_event, identity's conversation_turn/memory).
+    `node_type` itself stays a free string -- these are documentation
+    and the vocabulary `KnowledgeGraph`'s own convenience constructors
+    use, not an enforced enum.
+    """
+
+    COMPONENT = "component"
+    MATERIAL = "material"
+    PROJECT = "project"
+    STANDARD = "standard"
+    MEMORY = "memory"
+    EVENT = "event"
+    CONCEPT = "concept"
+    GOAL = "goal"
+
+class RelationType:
+    """Well-known `relation_type` values for the engineering ontology
+    (`made_of`, `contains`, `complies_with`) plus the generic ones
+    already used elsewhere in the graph (`related_to`, `followed_by`)."""
+
+    MADE_OF = "made_of"
+    CONTAINS = "contains"
+    COMPLIES_WITH = "complies_with"
+    RELATED_TO = "related_to"
+    FOLLOWED_BY = "followed_by"
+    DEPENDS_ON = "depends_on"
 
 # =============================================================================
 # Configuration
@@ -163,6 +226,12 @@ class KnowledgeGraphConfig:
         "module.stopped",
     )
     max_search_results: int = 50
+    # If set, remember() checks for a near-duplicate (cosine similarity
+    # >= this threshold) before creating a new node, reinforcing the
+    # existing one instead -- real "continuous update" rather than
+    # unbounded duplicate accumulation. None disables the check (fast,
+    # predictable default: always create a new node).
+    dedupe_threshold: Optional[float] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 # =============================================================================
@@ -197,6 +266,118 @@ class KnowledgeStoreProvider(Protocol):
     def persist(self) -> None: ...
     def load(self) -> None: ...
     def check_available(self) -> bool: ...
+
+@runtime_checkable
+class VectorIndex(Protocol):
+    """Maintains an incrementally-updatable index over node embeddings
+    for `KnowledgeGraph.search()` to query, so a search doesn't have to
+    re-collect and re-score every node from scratch each time."""
+
+    def upsert(self, node_id: str, vector: tuple[float, ...]) -> None: ...
+    def remove(self, node_id: str) -> None: ...
+    def query(self, vector: tuple[float, ...], top_k: int, *, candidate_ids: Optional[frozenset[str]] = None) -> tuple[tuple[str, float], ...]: ...
+    def check_available(self) -> bool: ...
+
+def _cosine_similarity(a: tuple[float, ...], b: tuple[float, ...]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+class InMemoryVectorIndex:
+    """
+    Exact (not approximate) nearest-neighbor search over whatever
+    embeddings have been upserted, accelerated with numpy (a single
+    vectorized matrix-vector product) when it's installed, falling back
+    to a pure-Python loop otherwise. "Efficient" here means "no
+    redundant per-search rebuild work and a much lower constant factor
+    via vectorization" -- this is still an exact O(N) scan either way,
+    not sub-linear approximate search. A dirty-flag defers rebuilding
+    the backing matrix until the next query that actually needs it, so
+    a burst of add_node()/update_node() calls costs O(1) each rather
+    than O(N) per call. Wire in a real ANN library (FAISS, hnswlib, ...)
+    via the `VectorIndex` Protocol if a graph grows large enough that
+    even this stops being fast enough.
+    """
+
+    def __init__(self) -> None:
+        self._vectors: dict[str, tuple[float, ...]] = {}
+        self._numpy_available = self._check_numpy()
+        self._matrix: Any = None
+        self._matrix_ids: list[str] = []
+        self._dirty = True
+
+    @staticmethod
+    def _check_numpy() -> bool:
+        try:
+            import numpy  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def check_available(self) -> bool:
+        return True  # works either way -- numpy only changes the constant factor
+
+    def upsert(self, node_id: str, vector: tuple[float, ...]) -> None:
+        self._vectors[node_id] = vector
+        self._dirty = True
+
+    def remove(self, node_id: str) -> None:
+        if self._vectors.pop(node_id, None) is not None:
+            self._dirty = True
+
+    def _ensure_built(self) -> None:
+        if not self._dirty:
+            return
+        self._matrix_ids = list(self._vectors.keys())
+        if self._numpy_available and self._matrix_ids:
+            import numpy as np
+            self._matrix = np.array([self._vectors[node_id] for node_id in self._matrix_ids], dtype=np.float32)
+        else:
+            self._matrix = None
+        self._dirty = False
+
+    def query(
+        self, vector: tuple[float, ...], top_k: int, *, candidate_ids: Optional[frozenset[str]] = None
+    ) -> tuple[tuple[str, float], ...]:
+        self._ensure_built()
+        if not self._matrix_ids or top_k <= 0:
+            return ()
+
+        if self._numpy_available and self._matrix is not None:
+            import numpy as np
+
+            query_vec = np.asarray(vector, dtype=np.float32)
+            query_norm = float(np.linalg.norm(query_vec))
+            if query_norm == 0.0:
+                return ()
+
+            row_norms = np.linalg.norm(self._matrix, axis=1)
+            safe_norms = np.where(row_norms == 0.0, 1.0, row_norms)
+            scores = (self._matrix @ query_vec) / (safe_norms * query_norm)
+
+            if candidate_ids is not None:
+                mask = np.array([node_id in candidate_ids for node_id in self._matrix_ids])
+                scores = np.where(mask, scores, -np.inf)
+
+            k = min(top_k, len(self._matrix_ids))
+            partitioned = np.argpartition(-scores, k - 1)[:k] if k < len(scores) else np.arange(len(scores))
+            ordered = partitioned[np.argsort(-scores[partitioned])]
+            return tuple(
+                (self._matrix_ids[i], float(scores[i])) for i in ordered if scores[i] != float("-inf")
+            )
+
+        scored = [
+            (node_id, _cosine_similarity(vector, vec))
+            for node_id, vec in self._vectors.items()
+            if candidate_ids is None or node_id in candidate_ids
+        ]
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return tuple(scored[:top_k])
 
 # =============================================================================
 # Default Embedding Provider
@@ -378,11 +559,14 @@ class InMemoryKnowledgeStore:
             "created_at": node.created_at.isoformat(),
             "updated_at": node.updated_at.isoformat(),
             "source": node.source,
+            "access_count": node.access_count,
+            "last_accessed_at": node.last_accessed_at.isoformat() if node.last_accessed_at else None,
         }
 
     @staticmethod
     def _node_from_dict(data: dict[str, Any]) -> KnowledgeNode:
         embedding = data.get("embedding")
+        last_accessed_at = data.get("last_accessed_at")
         return KnowledgeNode(
             id=data["id"],
             label=data["label"],
@@ -393,6 +577,8 @@ class InMemoryKnowledgeStore:
             created_at=datetime.fromisoformat(data["created_at"]),
             updated_at=datetime.fromisoformat(data["updated_at"]),
             source=data.get("source", "unknown"),
+            access_count=int(data.get("access_count", 0)),
+            last_accessed_at=datetime.fromisoformat(last_accessed_at) if last_accessed_at else None,
         )
 
     @staticmethod
@@ -441,6 +627,7 @@ class KnowledgeGraph:
         config: Optional[KnowledgeGraphConfig] = None,
         store: Optional[KnowledgeStoreProvider] = None,
         embedding_provider: Optional[EmbeddingProvider] = None,
+        vector_index: Optional[VectorIndex] = None,
     ) -> None:
         self._services = services
         self._config = config or KnowledgeGraphConfig()
@@ -450,6 +637,7 @@ class KnowledgeGraph:
         self._embeddings: EmbeddingProvider = embedding_provider or HashingEmbeddingProvider(
             dimensions=self._config.embedding_dimensions
         )
+        self._vector_index: VectorIndex = vector_index or InMemoryVectorIndex()
 
         self._kernel: Any = None
         self._identity: Optional[Identity] = None
@@ -503,6 +691,10 @@ class KnowledgeGraph:
             await asyncio.to_thread(self._store.load)
         except StoreError:
             logger.exception("Failed to load persisted knowledge graph -- starting from an empty graph.")
+
+        for node in self._store.all_nodes():
+            if node.embedding is not None:
+                self._vector_index.upsert(node.id, node.embedding)
 
         self._embeddings_available = await self._probe(self._embeddings)
         if not self._embeddings_available:
@@ -685,6 +877,8 @@ class KnowledgeGraph:
             source=source,
         )
         self._store.save_node(node)
+        if node.embedding is not None:
+            self._vector_index.upsert(node.id, node.embedding)
         logger.info("Node added.", extra={"node_id": identifier, "node_type": node_type})
         return node
 
@@ -727,19 +921,116 @@ class KnowledgeGraph:
             created_at=node.created_at,
             updated_at=datetime.utcnow(),
             source=node.source,
+            access_count=node.access_count,
+            last_accessed_at=node.last_accessed_at,
         )
         self._store.save_node(updated)
+        if embedding is not None:
+            self._vector_index.upsert(node.id, embedding)
+        else:
+            self._vector_index.remove(node.id)
         logger.info("Node updated.", extra={"node_id": node_id})
         return updated
 
     def remove_node(self, node_id: str) -> bool:
         removed = self._store.delete_node(node_id)
         if removed:
+            self._vector_index.remove(node_id)
             logger.info("Node removed.", extra={"node_id": node_id})
         return removed
 
     def all_nodes(self) -> tuple[KnowledgeNode, ...]:
         return self._store.all_nodes()
+
+    # ------------------------------------------------------------------
+    # Engineering domain modeling (components, materials, projects, standards)
+    # ------------------------------------------------------------------
+    #
+    # Thin, honest convenience wrappers over add_node()/add_relation()
+    # for the vocabulary in NodeType/RelationType -- real structured
+    # storage for the domain this graph is meant to model, not a new
+    # subsystem. node_type/relation_type stay free strings underneath;
+    # nothing here is enforced beyond what these methods choose to link.
+
+    def add_component(
+        self,
+        label: str,
+        *,
+        description: str = "",
+        part_number: Optional[str] = None,
+        material_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        attributes: Optional[dict[str, Any]] = None,
+        source: str = "unknown",
+    ) -> KnowledgeNode:
+        """Store a component, optionally linked to a material it's
+        `made_of` and/or a project that `contains` it."""
+        merged_attributes = dict(attributes or {})
+        if part_number:
+            merged_attributes["part_number"] = part_number
+
+        node = self.add_node(
+            label=label, content=description or label, node_type=NodeType.COMPONENT,
+            attributes=merged_attributes, source=source,
+        )
+        if material_id is not None:
+            self.add_relation(node.id, material_id, RelationType.MADE_OF)
+        if project_id is not None:
+            self.add_relation(project_id, node.id, RelationType.CONTAINS)
+        return node
+
+    def add_material(
+        self,
+        label: str,
+        *,
+        description: str = "",
+        properties: Optional[dict[str, Any]] = None,
+        standard_id: Optional[str] = None,
+        source: str = "unknown",
+    ) -> KnowledgeNode:
+        """Store a material, optionally linked to a standard it
+        `complies_with` (e.g. an alloy spec)."""
+        node = self.add_node(
+            label=label, content=description or label, node_type=NodeType.MATERIAL,
+            attributes=properties or {}, source=source,
+        )
+        if standard_id is not None:
+            self.add_relation(node.id, standard_id, RelationType.COMPLIES_WITH)
+        return node
+
+    def add_project(
+        self,
+        label: str,
+        *,
+        description: str = "",
+        attributes: Optional[dict[str, Any]] = None,
+        source: str = "unknown",
+    ) -> KnowledgeNode:
+        """Store a project -- typically the `contains` target for
+        add_component()'s `project_id`."""
+        return self.add_node(
+            label=label, content=description or label, node_type=NodeType.PROJECT,
+            attributes=attributes or {}, source=source,
+        )
+
+    def add_standard(
+        self,
+        label: str,
+        *,
+        description: str = "",
+        authority: str = "",
+        attributes: Optional[dict[str, Any]] = None,
+        source: str = "unknown",
+    ) -> KnowledgeNode:
+        """Store a standard/norm (e.g. an ISO/ASTM spec), optionally
+        recording the issuing `authority`."""
+        merged_attributes = dict(attributes or {})
+        if authority:
+            merged_attributes["authority"] = authority
+        return self.add_node(
+            label=label, content=description or label, node_type=NodeType.STANDARD,
+            attributes=merged_attributes, source=source,
+        )
 
     # ------------------------------------------------------------------
     # Relation CRUD
@@ -875,26 +1166,28 @@ class KnowledgeGraph:
             raise InvalidQueryError("top_k must be positive.")
         top_k = min(top_k, self._config.max_search_results)
 
-        candidates = [node for node in self._store.all_nodes() if node_type is None or node.node_type == node_type]
-        if not candidates:
-            return ()
+        candidate_ids: Optional[frozenset[str]] = None
+        if node_type is not None:
+            candidate_ids = frozenset(node.id for node in self._store.all_nodes() if node.node_type == node_type)
+            if not candidate_ids:
+                return ()
 
         if self._embeddings_available:
             try:
                 query_vector = self._embeddings.embed(query)
             except Exception:
                 logger.exception("Query embedding failed -- falling back to keyword search.")
-                return self._keyword_search(query, candidates, top_k)
+                return self._keyword_search(query, node_type, top_k)
 
-            scored = [
-                SearchResult(node=node, score=self._cosine_similarity(query_vector, node.embedding))
-                for node in candidates
-                if node.embedding is not None
-            ]
-            scored.sort(key=lambda result: result.score, reverse=True)
-            return tuple(scored[:top_k])
+            hits = self._vector_index.query(query_vector, top_k, candidate_ids=candidate_ids)
+            results = []
+            for node_id, score in hits:
+                node = self._store.get_node(node_id)
+                if node is not None:
+                    results.append(SearchResult(node=node, score=score))
+            return tuple(results)
 
-        return self._keyword_search(query, candidates, top_k)
+        return self._keyword_search(query, node_type, top_k)
 
     async def search_async(
         self,
@@ -911,9 +1204,10 @@ class KnowledgeGraph:
     def _keyword_search(
         self,
         query: str,
-        candidates: list[KnowledgeNode],
+        node_type: Optional[str],
         top_k: int,
     ) -> tuple[SearchResult, ...]:
+        candidates = [node for node in self._store.all_nodes() if node_type is None or node.node_type == node_type]
         query_tokens = set(re.findall(r"[a-z0-9]+", query.lower()))
         scored: list[SearchResult] = []
         for node in candidates:
@@ -924,17 +1218,6 @@ class KnowledgeGraph:
         scored.sort(key=lambda result: result.score, reverse=True)
         return tuple(scored[:top_k])
 
-    @staticmethod
-    def _cosine_similarity(a: tuple[float, ...], b: tuple[float, ...]) -> float:
-        if not a or not b or len(a) != len(b):
-            return 0.0
-        dot = sum(x * y for x, y in zip(a, b))
-        norm_a = math.sqrt(sum(x * x for x in a))
-        norm_b = math.sqrt(sum(y * y for y in b))
-        if norm_a == 0.0 or norm_b == 0.0:
-            return 0.0
-        return dot / (norm_a * norm_b)
-
     def _safe_embed(self, text: str) -> Optional[tuple[float, ...]]:
         if not self._embeddings_available:
             return None
@@ -943,6 +1226,17 @@ class KnowledgeGraph:
         except Exception:
             logger.exception("Embedding generation failed for a node -- storing without a vector.")
             return None
+
+    def _touch(self, node_id: str) -> None:
+        """Bump access_count/last_accessed_at -- deliberately does NOT
+        change `updated_at` (that reflects content changes, not reads)
+        or re-embed anything, so it's cheap and side-effect-free besides
+        the usage signal itself."""
+        node = self._store.get_node(node_id)
+        if node is None:
+            return
+        touched = replace(node, access_count=node.access_count + 1, last_accessed_at=datetime.utcnow())
+        self._store.save_node(touched)
 
     # ------------------------------------------------------------------
     # Long-term memory convenience API
@@ -957,9 +1251,36 @@ class KnowledgeGraph:
         source: str = "unknown",
         link_to: Optional[str] = None,
         relation_type: str = "related_to",
+        dedupe_threshold: Optional[float] = None,
     ) -> KnowledgeNode:
-        """Store a fact/observation as a long-term memory node. Optionally
-        link it to an existing node (e.g. the memory's subject)."""
+        """
+        Store a fact/observation as a long-term memory node. Optionally
+        link it to an existing node (e.g. the memory's subject).
+
+        If `dedupe_threshold` is given (or `KnowledgeGraphConfig.dedupe_threshold`
+        is set and this argument is left as None), an existing node whose
+        embedding is at least that cosine-similar is reinforced (its
+        access count/last-accessed bumped) instead of creating a near-
+        duplicate -- real "continuous update" rather than unbounded
+        duplicate accumulation. Disabled by default (always creates a
+        new node) so behavior stays simple and predictable unless asked for.
+        """
+        threshold = dedupe_threshold if dedupe_threshold is not None else self._config.dedupe_threshold
+        if threshold is not None and self._embeddings_available:
+            try:
+                candidate_vector = self._embeddings.embed(content)
+                hits = self._vector_index.query(candidate_vector, 1)
+            except Exception:
+                hits = ()
+            if hits and hits[0][1] >= threshold:
+                existing_id, score = hits[0]
+                self._touch(existing_id)
+                logger.info(
+                    "remember() reinforced an existing near-duplicate instead of creating a new node.",
+                    extra={"node_id": existing_id, "similarity": round(score, 4)},
+                )
+                return self.get_node(existing_id)
+
         label = content if len(content) <= 60 else content[:57] + "..."
         node = self.add_node(label=label, content=content, node_type=node_type, attributes=metadata or {}, source=source)
 
@@ -969,8 +1290,129 @@ class KnowledgeGraph:
         return node
 
     def recall(self, query: str, *, top_k: int = 5) -> tuple[SearchResult, ...]:
-        """Semantic recall over everything remembered so far."""
-        return self.search(query, top_k=top_k, node_type=None)
+        """Semantic recall over everything remembered so far. Touches
+        (usage-tracks) every returned node."""
+        results = self.search(query, top_k=top_k, node_type=None)
+        for result in results:
+            self._touch(result.node.id)
+        return results
+
+    # ------------------------------------------------------------------
+    # RAG (retrieval-augmented generation) -- the "R", honestly scoped
+    # ------------------------------------------------------------------
+    #
+    # StarkOS has no LLM wired in yet (the AI Runtime with real
+    # generation providers is still on the roadmap), so this is
+    # retrieval infrastructure only: it finds and formats the most
+    # relevant grounded context for a query. Feeding that context into
+    # an actual generator (prompting an LLM) is the caller's job once
+    # StarkOS has one to hand it to -- these methods never generate text
+    # themselves, only retrieve and format real, stored nodes.
+
+    def retrieve_context(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        node_types: Optional[Sequence[str]] = None,
+        include_neighbors: bool = False,
+    ) -> tuple[RetrievedContext, ...]:
+        """
+        Retrieve the most relevant stored nodes for `query`, optionally
+        restricted to specific node types (e.g. only `component`/
+        `standard` for an engineering question) and optionally enriched
+        with one hop of neighbor context. Touches every returned node.
+        """
+        if node_types:
+            merged: list[SearchResult] = []
+            for node_type in node_types:
+                merged.extend(self.search(query, top_k=top_k, node_type=node_type))
+            merged.sort(key=lambda result: result.score, reverse=True)
+            results = tuple(merged[:top_k])
+        else:
+            results = self.search(query, top_k=top_k)
+
+        contexts = []
+        for result in results:
+            relation_notes: tuple[str, ...] = ()
+            if include_neighbors:
+                neighbor_nodes = self.neighbors(result.node.id, direction="both")
+                relation_notes = tuple(f"related to '{neighbor.label}'" for neighbor in neighbor_nodes[:5])
+            contexts.append(RetrievedContext(node=result.node, score=result.score, relation_context=relation_notes))
+            self._touch(result.node.id)
+
+        return tuple(contexts)
+
+    async def retrieve_context_async(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        node_types: Optional[Sequence[str]] = None,
+        include_neighbors: bool = False,
+    ) -> tuple[RetrievedContext, ...]:
+        return await asyncio.to_thread(
+            self.retrieve_context, query, top_k=top_k, node_types=node_types, include_neighbors=include_neighbors
+        )
+
+    @staticmethod
+    def format_context_block(contexts: Sequence[RetrievedContext], *, max_chars: int = 2000) -> str:
+        """
+        Render retrieved context as a plain-text block, one line per
+        node, suitable for prepending to a prompt once StarkOS has a
+        real generator to hand it to. Truncates at `max_chars` (never
+        splits a line mid-way) so it can't unboundedly grow a prompt.
+        """
+        lines: list[str] = []
+        used = 0
+        for context in contexts:
+            line = f"- [{context.node.node_type}] {context.node.label}: {context.node.content}"
+            if context.relation_context:
+                line += f" ({'; '.join(context.relation_context)})"
+            if used + len(line) + 1 > max_chars:
+                break
+            lines.append(line)
+            used += len(line) + 1
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Memory management
+    # ------------------------------------------------------------------
+
+    def prune_stale_memories(
+        self,
+        *,
+        max_age_days: Optional[float] = None,
+        never_accessed_only: bool = False,
+        node_type: Optional[str] = "memory",
+    ) -> int:
+        """
+        Real, honest memory management: remove nodes older than
+        `max_age_days` (by `created_at`), optionally restricted to ones
+        that were never touched by search()/recall() and/or a specific
+        node_type (defaults to "memory" -- pruning structural nodes like
+        components/materials by age would usually be wrong). Returns how
+        many nodes were removed. A no-op call (both filters None/False)
+        prunes nothing, by design -- this never runs implicitly.
+        """
+        if max_age_days is None and not never_accessed_only:
+            return 0
+
+        cutoff = datetime.utcnow() - timedelta(days=max_age_days) if max_age_days is not None else None
+        removed = 0
+        for node in self._store.all_nodes():
+            if node_type is not None and node.node_type != node_type:
+                continue
+            if cutoff is not None and node.created_at > cutoff:
+                continue
+            if never_accessed_only and node.access_count > 0:
+                continue
+            if self.remove_node(node.id):
+                removed += 1
+
+        if removed:
+            logger.info("Stale memories pruned.", extra={"removed": removed, "node_type": node_type or "any"})
+        return removed
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -981,6 +1423,8 @@ class KnowledgeGraph:
             "node_count": self.node_count,
             "relation_count": self.relation_count,
             "embeddings_available": self._embeddings_available,
+            "vector_index_backend": "numpy" if getattr(self._vector_index, "_numpy_available", False) else "pure_python",
+            "dedupe_threshold": self._config.dedupe_threshold,
             "tracking_system_events": bool(self._event_subscriptions),
             "persist_path": str(self._config.persist_path) if self._config.persist_path else None,
         }
