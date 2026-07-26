@@ -2,63 +2,98 @@
 core/cognitive_engine.py
 ==========================
 
-Goal-driven orchestration for StarkOS.
+Goal-driven orchestration for StarkOS -- the coordination layer that
+turns a goal into a traceable, verifiable plan of specialist actions.
 
 Responsibilities
 ----------------
 - Accept a goal (free text + optional structured metadata) from a user
-  or another module.
-- Decompose it into a multi-step, dependency-ordered Plan, dispatching
-  each step to a registered "specialist" (Identity, KnowledgeGraph,
-  AutoEngineer, and -- once one exists -- a Digital Twin).
-- Execute a Plan: run each task in dependency order, pass task outputs
-  forward as inputs to later tasks, validate results, retry on failure,
-  and optionally pause for human approval between steps.
-- Record goals, plans and executions into KnowledgeGraph as long-term,
-  searchable memory of what StarkOS has been asked to do and how it went.
+  or another module, decompose it into a multi-step, dependency-ordered
+  Plan, and execute it: independent tasks run concurrently (real
+  parallelism, not simulated), dependent ones wait on their inputs,
+  outputs flow forward via `$task:`/`$blackboard:` references, results
+  are validated and retried, and a human can be asked to approve
+  individual steps.
+- Layered memory: a bounded short-term buffer (immediate context),
+  episodic recall of past goals/executions, and semantic recall over
+  general stored knowledge -- see the honesty note on how these three
+  are actually built.
+- A "multi-agent" system: bound specialist modules (Identity,
+  KnowledgeGraph, AutoEngineer, RAGEngine, ...) are the agents, invoked
+  through an explicit, reviewable action allow-list; they communicate
+  through task outputs and a shared per-execution blackboard, and
+  independent ones execute in parallel.
+- Post-execution reflection: a rule-based check of whether the plan
+  actually completed, with simple, mechanically-derived suggestions --
+  see the honesty note on what this reflection is and isn't.
+- Every goal/plan/execution is recorded into KnowledgeGraph (long-term,
+  searchable memory) and, if a DigitalThread is bound, into its
+  immutable, hash-chained ledger -- full goal-to-execution traceability.
 
 Honesty about scope
 --------------------
 This is an **orchestration and planning framework**, not a general
 reasoning engine. It contains no language model and performs no genuine
-natural-language understanding. Concretely:
+natural-language understanding, autonomous multi-agent reasoning, or
+deep semantic verification. Concretely:
 
-- "Understanding the user's goal" is rule-based pattern matching (see
-  `HeuristicGoalInterpreter`): it recognizes a handful of known verbs/
-  phrases ("otimizar", "bom"/"lista de materiais", "risco", "buscar"/
-  "lembrar") and maps them to specialist actions. Anything it doesn't
-  recognize falls back to `Identity.respond()` for a conversational
-  reply -- it is not silently "understood" in some deeper sense.
+- "Understanding the user's goal" -- including a *vague* one -- is
+  rule-based pattern matching (see `HeuristicGoalInterpreter`): it
+  recognizes a handful of known verbs/phrases and maps them to
+  specialist actions. Anything it doesn't recognize falls back to
+  `Identity.respond()` -- it is never silently "understood" in some
+  deeper sense, however the goal is phrased.
+- **"Layered memory" is a thin, honest interface over systems that
+  already exist**, not three new memory engines: short-term is a plain
+  bounded in-process buffer (gone on restart, by design); episodic and
+  semantic recall both delegate to KnowledgeGraph (and RAGEngine, if
+  bound) -- which already do real storage, embeddings and retrieval.
+  Building a second, separate long-term memory system here would just
+  duplicate what those modules already do correctly.
+- **"Agents" are the same bound specialist modules as before**, under a
+  more evocative name -- never autonomous entities with their own
+  reasoning loop. "Communication between agents" is two concrete,
+  inspectable mechanisms: `$task:<id>.<path>` references (one task's
+  output feeds another's input) and a shared, per-execution
+  `$blackboard:<key>` namespace any task can publish a named value into
+  for later ones to read. "Parallel orchestration" is real: tasks with
+  no dependency on each other (the same level of the dependency graph)
+  run concurrently via `asyncio.gather` -- not sequential execution
+  dressed up as parallel.
+- **Reflection is a rule-based, mechanical check** (`HeuristicReflector`):
+  did tasks succeed, are there non-empty results, what's the obvious
+  next step if something failed. It is not semantic verification that
+  the goal was actually, meaningfully achieved -- StarkOS has no model
+  capable of that judgment call.
 - The actual engineering inputs for a task (a `DesignSpec`, an
   `Assembly`, a list of `RiskFactor`) are never invented by this module.
   They must be supplied by the caller via `Goal.metadata`, exactly as
   `AutoEngineer`'s own evaluators/constraints must be supplied by its
   caller. CognitiveEngine only decides *which* specialist/action a goal
-  maps to and *in what order* to run things -- never what the
-  engineering content of a task should be.
+  maps to and *in what order* (or in parallel) to run things -- never
+  what the engineering content of a task should be.
 - "Creating specialists" means registering (`bind_...`) already-built
   StarkOS modules under a name, and exposing an explicit, reviewable
-  allow-list of their methods as callable "actions" -- never dynamically
+  allow-list of their methods as callable actions -- never dynamically
   invoking arbitrary attributes/strings, and never generating or
   executing new code at runtime.
 
-The `GoalInterpreter` and `ReviewProvider` Protocols exist precisely so
-that a real language-model-backed planner (once StarkOS's AI Runtime/LLM
-providers exist) or a real interactive human-approval hook can replace
-today's defaults without touching `CognitiveEngine` itself.
+The `GoalInterpreter`, `ReviewProvider` and `Reflector` Protocols exist
+precisely so that a real language-model-backed planner/verifier (once
+StarkOS's AI Runtime/LLM providers exist) can replace today's honest,
+simple defaults without touching `CognitiveEngine` itself.
 
 Design
 ------
-Same low-coupling shape as `voice_interface`/`knowledge_graph`/
-`auto_engineer`: pluggable Protocols with transparent, dependency-free
-defaults.
+Same low-coupling shape as the rest of StarkOS: pluggable Protocols with
+transparent, dependency-free defaults.
 
 - `GoalInterpreter` -- turns a `Goal` into a `Plan`. Default:
   `HeuristicGoalInterpreter` (keyword/pattern matching).
 - `ReviewProvider` -- approves or rejects a task before it runs, in
-  collaborative mode. Default: `AutoApproveReviewer` (autonomous mode);
-  `CallbackReviewProvider` wraps any sync/async callable for a quick,
-  real human-in-the-loop hook (e.g. from the console).
+  collaborative mode. Default: `AutoApproveReviewer`.
+- `Reflector` -- reviews a completed execution. Default:
+  `HeuristicReflector` (rule-based, not semantic verification).
 
 `CognitiveEngine` satisfies the `Module` protocol (name/initialize/
 start/stop) and registers with the Kernel like any other StarkOS module:
@@ -66,7 +101,8 @@ start/stop) and registers with the Kernel like any other StarkOS module:
     engine = CognitiveEngine(services=services)
     engine.bind_identity(identity)
     engine.bind_knowledge_graph(knowledge_graph)
-    engine.bind_auto_engineer(auto_engineer)
+    engine.bind_rag_engine(rag_engine)
+    engine.bind_digital_thread(digital_thread)
     kernel.register_module(engine, name="cognitive_engine", priority=300)
 
     result = await engine.pursue_goal(
@@ -76,26 +112,30 @@ start/stop) and registers with the Kernel like any other StarkOS module:
             "bom_parameters": {"assembly": my_assembly},
         },
     )
+    print(result.reflection.summary, result.digital_thread_trace_id)
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
-import logging
 import re
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from typing import Any, Callable, Optional, Protocol, Sequence, runtime_checkable
 
 from core.auto_engineer import AutoEngineer
+from core.event_bus import Event, EventBus
 from core.identity import Identity
 from core.knowledge_graph import KnowledgeGraph
+from core.logger import get_logger
 from core.service_container import ServiceContainer
 
-logger = logging.getLogger("starkos.cognitive_engine")
+logger = get_logger("cognitive_engine")
 
 # =============================================================================
 # Exceptions
